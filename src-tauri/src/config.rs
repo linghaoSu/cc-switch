@@ -309,13 +309,17 @@ pub fn get_claude_settings_path() -> PathBuf {
     settings
 }
 
+/// Data directory under the home dir. This build runs beside the official
+/// CC Switch, so it keeps its own database, client state and logs.
+pub const APP_DIR_NAME: &str = ".cc-switch-copilot-patch";
+
 /// 获取应用配置目录路径 (~/.cc-switch)
 pub fn get_app_config_dir() -> PathBuf {
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }
 
-    let default_dir = get_home_dir().join(".cc-switch");
+    let default_dir = get_home_dir().join(APP_DIR_NAME);
 
     // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
     // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
