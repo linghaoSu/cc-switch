@@ -1545,6 +1545,14 @@ impl RequestForwarder {
         //   2. 再清洗孤立 tool_result（防止上游 API 报错）
         //   3. 再合并 tool_result + text（减少 premium 计费）
         let run_copilot_optimizer = is_copilot_claude_body && self.copilot_optimizer_config.enabled;
+        // Native Messages passthrough keeps thinking blocks: Anthropic validates them
+        // in tool-use loops, and the strip only exists for the OpenAI-format bridges.
+        let copilot_native_messages = run_copilot_optimizer
+            && self.copilot_optimizer_config.strip_thinking
+            && self
+                .resolve_copilot_api_format(provider, &mapped_body)
+                .await
+                == "anthropic";
         let copilot_request_context = if run_copilot_optimizer {
             // 1. 在原始 body 上分类 — 必须在清洗/合并之前执行
             //    孤立 tool_result 仍保持 tool_result 类型，分类能正确识别为 agent
@@ -1575,7 +1583,7 @@ impl RequestForwarder {
 
             // 3.5. 主动剥离 thinking block — Copilot 走 OpenAI 兼容端点不识别该块
             //      避免上游拒绝后由 rectifier 反应式重试（首次请求已消耗 quota）
-            if self.copilot_optimizer_config.strip_thinking {
+            if self.copilot_optimizer_config.strip_thinking && !copilot_native_messages {
                 mapped_body = super::copilot_optimizer::strip_thinking_blocks(mapped_body);
             }
 
@@ -3174,11 +3182,17 @@ impl RequestForwarder {
 
     async fn resolve_copilot_api_format(&self, provider: &Provider, body: &Value) -> &'static str {
         let model = body.get("model").and_then(|value| value.as_str());
-        let vendor = match model {
-            Some(model_id) => self.copilot_model_vendor(provider, model_id).await,
+        let record = match model {
+            Some(model_id) => self.copilot_model_record(provider, model_id).await,
             None => None,
         };
-        copilot_api_format_for_vendor(vendor.as_deref())
+        copilot_api_format_for_model(
+            record.as_ref().map(|model| model.vendor.as_str()),
+            record
+                .as_ref()
+                .map(|model| model.supported_endpoints.as_slice())
+                .unwrap_or_default(),
+        )
     }
 
     /// 用 Copilot live `/models` 列表确认 model ID 真实可用，找不到时按 family 降级。
@@ -3264,7 +3278,11 @@ impl RequestForwarder {
         resolved.map_err(|error| codex_copilot_lookup_error(model_id, error))
     }
 
-    async fn copilot_model_vendor(&self, provider: &Provider, model_id: &str) -> Option<String> {
+    async fn copilot_model_record(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+    ) -> Option<super::providers::copilot_auth::CopilotModel> {
         let Some(app_handle) = &self.app_handle else {
             log::debug!("[Copilot] AppHandle unavailable, fallback to chat/completions");
             return None;
@@ -3277,17 +3295,17 @@ impl RequestForwarder {
             .as_ref()
             .and_then(|m| m.managed_account_id_for("github_copilot"));
 
-        let vendor_result = match account_id.as_deref() {
+        let record_result = match account_id.as_deref() {
             Some(id) => {
                 copilot_auth
-                    .get_model_vendor_for_account(id, model_id)
+                    .get_model_record_for_account(id, model_id)
                     .await
             }
-            None => copilot_auth.get_model_vendor(model_id).await,
+            None => copilot_auth.get_model_record(model_id).await,
         };
 
-        match vendor_result {
-            Ok(Some(vendor)) => Some(vendor),
+        match record_result {
+            Ok(Some(record)) => Some(record),
             Ok(None) => {
                 log::debug!(
                     "[Copilot] Model vendor unavailable for {model_id}, fallback to chat/completions"
@@ -3917,9 +3935,24 @@ fn rewrite_codex_endpoint_for_copilot(
     (rewritten, passthrough_query)
 }
 
-fn copilot_api_format_for_vendor(vendor: Option<&str>) -> &'static str {
+/// Pick the Copilot upstream protocol for a Claude-client request.
+///
+/// Anthropic models that advertise `/v1/messages` are passed through natively:
+/// the Chat Completions bridge drops `cache_control` breakpoints and Copilot's
+/// chat endpoint stops prefix caching at the first mid-conversation `system`
+/// message Claude Code inserts, so every turn re-bills the whole history.
+fn copilot_api_format_for_model(
+    vendor: Option<&str>,
+    supported_endpoints: &[String],
+) -> &'static str {
     if vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai")) {
         "openai_responses"
+    } else if vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case("anthropic"))
+        && supported_endpoints
+            .iter()
+            .any(|endpoint| endpoint.trim_end_matches('/') == "/v1/messages")
+    {
+        "anthropic"
     } else {
         "openai_chat"
     }
@@ -6229,16 +6262,26 @@ mod tests {
     }
 
     #[test]
-    fn copilot_transport_uses_responses_only_for_openai_vendor() {
+    fn copilot_transport_selects_protocol_by_vendor_and_endpoints() {
+        let messages = vec!["/v1/messages".to_string(), "/chat/completions".to_string()];
+        let chat_only = vec!["/chat/completions".to_string()];
         assert_eq!(
-            copilot_api_format_for_vendor(Some("OpenAI")),
+            copilot_api_format_for_model(Some("OpenAI"), &chat_only),
             "openai_responses"
         );
         assert_eq!(
-            copilot_api_format_for_vendor(Some("Anthropic")),
+            copilot_api_format_for_model(Some("Anthropic"), &messages),
+            "anthropic"
+        );
+        assert_eq!(
+            copilot_api_format_for_model(Some("Anthropic"), &chat_only),
             "openai_chat"
         );
-        assert_eq!(copilot_api_format_for_vendor(None), "openai_chat");
+        assert_eq!(
+            copilot_api_format_for_model(Some("Anthropic"), &[]),
+            "openai_chat"
+        );
+        assert_eq!(copilot_api_format_for_model(None, &messages), "openai_chat");
     }
 
     #[test]

@@ -380,6 +380,7 @@ async fn handle_messages_for_app(
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
+    let result_api_format_resolved = result.claude_api_format.is_some();
     let api_format = result
         .claude_api_format
         .as_deref()
@@ -394,7 +395,13 @@ async fn handle_messages_for_app(
             app_type.as_str()
         ))
     })?;
-    let needs_transform = adapter.needs_transform(&ctx.provider);
+    // The forwarder resolves the wire format per request (Copilot picks native
+    // Messages for Anthropic models), so the response must follow that decision
+    // rather than the provider-level default.
+    let needs_transform = match result_api_format_resolved {
+        true => super::providers::claude_api_format_needs_transform(&api_format),
+        false => adapter.needs_transform(&ctx.provider),
+    };
 
     // Claude 特有：格式转换处理
     if needs_transform {
