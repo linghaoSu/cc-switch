@@ -1571,14 +1571,23 @@ impl RequestForwarder {
                 mapped_body = super::copilot_optimizer::merge_tool_results(mapped_body);
             }
 
-            // 4. Warmup 小模型降级
+            // 4. Warmup 小模型降级（只在省得下 premium request、且目标模型可用时）
             if self.copilot_optimizer_config.warmup_downgrade && classification.is_warmup {
-                log::info!(
-                    "[Copilot] Warmup 请求降级到模型: {}",
-                    self.copilot_optimizer_config.warmup_model
-                );
-                mapped_body["model"] =
-                    serde_json::json!(&self.copilot_optimizer_config.warmup_model);
+                let token_based_billing = self.copilot_token_based_billing(provider).await;
+                let warmup_model = if token_based_billing == Some(true) {
+                    None
+                } else {
+                    self.copilot_model_record(provider, &self.copilot_optimizer_config.warmup_model)
+                        .await
+                        .map(|model| model.id)
+                };
+                match copilot_warmup_target(token_based_billing, warmup_model) {
+                    Ok(model) => {
+                        log::info!("[Copilot] Warmup 请求降级到模型: {model}");
+                        mapped_body["model"] = serde_json::json!(model);
+                    }
+                    Err(reason) => log::info!("[Copilot] Warmup 请求保留原模型（{reason}）"),
+                }
             }
 
             // 预计算确定性 Request ID（在 body 被 move 之前）
@@ -3306,17 +3315,30 @@ impl RequestForwarder {
         match record_result {
             Ok(Some(record)) => Some(record),
             Ok(None) => {
-                log::debug!(
-                    "[Copilot] Model vendor unavailable for {model_id}, fallback to chat/completions"
-                );
+                log::debug!("[Copilot] Model {model_id} is not in the live model list");
                 None
             }
             Err(err) => {
                 log::warn!(
-                    "[Copilot] Failed to resolve model vendor for {model_id}, fallback to chat/completions: {err}"
+                    "[Copilot] Failed to look up model {model_id} in the live model list: {err}"
                 );
                 None
             }
+        }
+    }
+
+    /// Whether the provider's Copilot account is on token-based (usage-based) billing.
+    async fn copilot_token_based_billing(&self, provider: &Provider) -> Option<bool> {
+        let app_handle = self.app_handle.as_ref()?;
+        let copilot_state = app_handle.state::<CopilotAuthState>();
+        let copilot_auth = copilot_state.0.read().await;
+        let account_id = provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.managed_account_id_for("github_copilot"));
+        match account_id.as_deref() {
+            Some(id) => copilot_auth.is_token_based_billing_for_account(id).await,
+            None => copilot_auth.is_token_based_billing().await,
         }
     }
 
@@ -3944,6 +3966,22 @@ fn uses_anthropic_rectifiers(provider_type: Option<ProviderType>) -> bool {
         provider_type,
         Some(ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::GitHubCopilot)
     )
+}
+
+/// Model a Claude Code warmup request is rewritten to, or why it keeps the requested model.
+///
+/// The downgrade only saves something on accounts billed per premium request. On
+/// token-based billing it would just replace the user's model, and a model missing from
+/// the account's live `/models` list (such as `gpt-5-mini`, retired on 2026-10-19) is
+/// rejected upstream with `model_not_available_for_integrator`.
+fn copilot_warmup_target(
+    token_based_billing: Option<bool>,
+    resolved_warmup_model: Option<String>,
+) -> Result<String, &'static str> {
+    if token_based_billing == Some(true) {
+        return Err("账号按 token 计费，降级不省费用");
+    }
+    resolved_warmup_model.ok_or("降级模型不在账号的模型列表中")
 }
 
 /// Pick the Copilot upstream protocol for a Claude-client request.
@@ -6289,6 +6327,23 @@ mod tests {
             assert!(!uses_anthropic_rectifiers(Some(provider_type)));
         }
         assert!(!uses_anthropic_rectifiers(None));
+    }
+
+    #[test]
+    fn copilot_warmup_downgrades_only_when_it_saves_requests_and_the_model_exists() {
+        let luna = || Some("gpt-6-luna".to_string());
+        assert_eq!(
+            copilot_warmup_target(Some(false), luna()),
+            Ok("gpt-6-luna".to_string())
+        );
+        // Billing unknown (older GHES, lookup failed): keep the previous behaviour.
+        assert_eq!(
+            copilot_warmup_target(None, luna()),
+            Ok("gpt-6-luna".to_string())
+        );
+        assert!(copilot_warmup_target(Some(true), luna()).is_err());
+        assert!(copilot_warmup_target(Some(false), None).is_err());
+        assert!(copilot_warmup_target(None, None).is_err());
     }
 
     #[test]

@@ -218,6 +218,9 @@ pub struct CopilotUsageResponse {
     /// API 端点信息 (用于动态获取 API URL)
     #[serde(default)]
     pub endpoints: Option<CopilotEndpoints>,
+    /// 是否按 token 计费（usage-based billing）。旧版 GHES 等可能不返回该字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_based_billing: Option<bool>,
 }
 
 /// Copilot API 端点信息
@@ -566,6 +569,8 @@ pub struct CopilotAuthManager {
     copilot_models: Arc<RwLock<HashMap<String, Vec<CopilotModel>>>>,
     /// Copilot API 端点缓存（key = GitHub user ID，从 /copilot_internal/user 获取）
     api_endpoints: Arc<RwLock<HashMap<String, String>>>,
+    /// 是否按 token 计费（key = GitHub user ID，与端点来自同一次 /copilot_internal/user）
+    token_based_billing: Arc<RwLock<HashMap<String, bool>>>,
     /// 每个账号的端点拉取锁，避免并发拉取重复打 GitHub API
     endpoint_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// 存储路径
@@ -588,6 +593,7 @@ impl CopilotAuthManager {
             copilot_tokens: Arc::new(RwLock::new(HashMap::new())),
             copilot_models: Arc::new(RwLock::new(HashMap::new())),
             api_endpoints: Arc::new(RwLock::new(HashMap::new())),
+            token_based_billing: Arc::new(RwLock::new(HashMap::new())),
             endpoint_locks: Arc::new(RwLock::new(HashMap::new())),
             storage_path,
             pending_migration: Arc::new(RwLock::new(None)),
@@ -645,6 +651,10 @@ impl CopilotAuthManager {
         {
             let mut api_endpoints = self.api_endpoints.write().await;
             api_endpoints.remove(account_id);
+        }
+        {
+            let mut token_based_billing = self.token_based_billing.write().await;
+            token_based_billing.remove(account_id);
         }
         {
             let mut endpoint_locks = self.endpoint_locks.write().await;
@@ -1146,6 +1156,8 @@ impl CopilotAuthManager {
             .await
             .map_err(|e| CopilotAuthError::ParseError(e.to_string()))?;
 
+        self.remember_token_based_billing(account_id, &usage).await;
+
         // 存储动态 API 端点（如果有）
         if let Some(ref endpoints) = usage.endpoints {
             let mut api_endpoints = self.api_endpoints.write().await;
@@ -1259,6 +1271,8 @@ impl CopilotAuthManager {
             .await
             .map_err(|e| CopilotAuthError::ParseError(e.to_string()))?;
 
+        self.remember_token_based_billing(account_id, &usage).await;
+
         let endpoint = match usage.endpoints {
             Some(endpoints) => endpoints.api.clone(),
             None => copilot_api_base(&domain),
@@ -1270,6 +1284,34 @@ impl CopilotAuthManager {
         log::debug!("[CopilotAuth] 账号 {account_id} 已缓存 API 端点");
 
         Ok(endpoint)
+    }
+
+    async fn remember_token_based_billing(&self, account_id: &str, usage: &CopilotUsageResponse) {
+        if let Some(token_based) = usage.token_based_billing {
+            let mut token_based_billing = self.token_based_billing.write().await;
+            token_based_billing.insert(account_id.to_string(), token_based);
+        }
+    }
+
+    /// 账号是否按 token 计费；未知（拉取失败或响应没有该字段）时为 `None`。
+    ///
+    /// 未缓存时复用 API 端点的惰性拉取：两者来自同一次 `/copilot_internal/user`。
+    pub async fn is_token_based_billing_for_account(&self, account_id: &str) -> Option<bool> {
+        if let Some(token_based) = self.token_based_billing.read().await.get(account_id) {
+            return Some(*token_based);
+        }
+        let _ = self.get_api_endpoint(account_id).await;
+        self.token_based_billing
+            .read()
+            .await
+            .get(account_id)
+            .copied()
+    }
+
+    /// 默认账号是否按 token 计费
+    pub async fn is_token_based_billing(&self) -> Option<bool> {
+        let account_id = self.resolve_default_account_id().await?;
+        self.is_token_based_billing_for_account(&account_id).await
     }
 
     async fn get_endpoint_lock(&self, account_id: &str) -> Arc<Mutex<()>> {
@@ -1358,6 +1400,10 @@ impl CopilotAuthManager {
         {
             let mut api_endpoints = self.api_endpoints.write().await;
             api_endpoints.clear();
+        }
+        {
+            let mut token_based_billing = self.token_based_billing.write().await;
+            token_based_billing.clear();
         }
         {
             let mut endpoint_locks = self.endpoint_locks.write().await;
@@ -2429,6 +2475,60 @@ mod tests {
 
         let api_endpoints = manager.api_endpoints.read().await;
         assert!(api_endpoints.is_empty());
+    }
+
+    fn usage_response(token_based_billing: Option<bool>) -> CopilotUsageResponse {
+        let quota = serde_json::json!({
+            "entitlement": 0, "remaining": 0, "percent_remaining": 100.0, "unlimited": true
+        });
+        let mut body = serde_json::json!({
+            "copilot_plan": "enterprise",
+            "quota_reset_date": "2026-11-01",
+            "quota_snapshots": {
+                "chat": quota, "completions": quota, "premium_interactions": quota
+            }
+        });
+        if let Some(token_based) = token_based_billing {
+            body["token_based_billing"] = serde_json::json!(token_based);
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn test_usage_response_reads_optional_token_based_billing() {
+        assert_eq!(usage_response(Some(true)).token_based_billing, Some(true));
+        assert_eq!(usage_response(Some(false)).token_based_billing, Some(false));
+        assert_eq!(usage_response(None).token_based_billing, None);
+    }
+
+    #[tokio::test]
+    async fn test_token_based_billing_is_cached_per_account() {
+        let temp_dir = tempdir().unwrap();
+        let manager = CopilotAuthManager::new(temp_dir.path().to_path_buf());
+
+        manager
+            .remember_token_based_billing("12345", &usage_response(Some(true)))
+            .await;
+        // 响应里没有该字段时保持未知，不写入缓存
+        manager
+            .remember_token_based_billing("67890", &usage_response(None))
+            .await;
+
+        assert_eq!(
+            manager.is_token_based_billing_for_account("12345").await,
+            Some(true)
+        );
+        // 未知账号：惰性拉取找不到账号，结果仍为未知
+        assert_eq!(
+            manager.is_token_based_billing_for_account("67890").await,
+            None
+        );
+
+        manager.clear_auth().await.unwrap();
+        assert_eq!(
+            manager.is_token_based_billing_for_account("12345").await,
+            None
+        );
     }
 
     #[tokio::test]
