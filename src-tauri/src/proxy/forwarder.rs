@@ -875,6 +875,7 @@ impl RequestForwarder {
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             let mut attempted_codex_upstream_format = None;
+            let mut attempted_claude_api_format = None;
             match self
                 .forward(
                     app_type,
@@ -886,6 +887,7 @@ impl RequestForwarder {
                     &extensions,
                     adapter.as_ref(),
                     &mut attempted_codex_upstream_format,
+                    &mut attempted_claude_api_format,
                 )
                 .await
             {
@@ -901,9 +903,10 @@ impl RequestForwarder {
                         .await);
                 }
                 Err(mut e) => {
-                    // 检测是否需要触发整流器（上游为 Anthropic Messages 的供应商）
+                    // 检测是否需要触发整流器（这次请求的上游是 Anthropic Messages）
                     let is_anthropic_provider = uses_anthropic_rectifiers(
                         ProviderType::from_app_type_and_config(app_type, provider),
+                        attempted_claude_api_format.as_deref(),
                     );
                     let mut signature_rectifier_non_retryable_client_error = false;
 
@@ -944,6 +947,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut media_retry_codex_upstream_format,
+                                    &mut None,
                                 )
                                 .await
                             {
@@ -1035,6 +1039,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut opaque_retry_codex_upstream_format,
+                                    &mut None,
                                 )
                                 .await
                             {
@@ -1141,6 +1146,7 @@ impl RequestForwarder {
                                         &extensions,
                                         adapter.as_ref(),
                                         &mut signature_retry_codex_upstream_format,
+                                        &mut None,
                                     )
                                     .await
                                 {
@@ -1240,6 +1246,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut budget_retry_codex_upstream_format,
+                                    &mut None,
                                 )
                                 .await
                             {
@@ -1368,6 +1375,8 @@ impl RequestForwarder {
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     /// `codex_upstream_format_out` 记下这次实际选中的 Codex 上游格式：成功时交给
     /// `finish_success`，失败时给整流判断用（Copilot 按模型逐次选协议，不能从静态配置推）。
+    /// `claude_api_format_out` 同理记下 Claude 请求这次解析出的上游格式，失败时决定
+    /// thinking 整流器是否适用。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
@@ -1380,8 +1389,10 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
         codex_upstream_format_out: &mut Option<CodexUpstreamFormat>,
+        claude_api_format_out: &mut Option<String>,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         *codex_upstream_format_out = None;
+        *claude_api_format_out = None;
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1703,6 +1714,7 @@ impl RequestForwarder {
         } else {
             None
         };
+        claude_api_format_out.clone_from(&resolved_claude_api_format);
         if adapter.name() == "Claude" {
             if let Some(api_format) = resolved_claude_api_format.as_deref() {
                 // 主动剥离 thinking block — Copilot 的 OpenAI 兼容端点不识别该块，避免上游拒绝后
@@ -3934,16 +3946,23 @@ fn rewrite_codex_endpoint_for_copilot(
     (rewritten, passthrough_query)
 }
 
-/// Providers whose errors can come from an Anthropic Messages endpoint and therefore
-/// need the thinking signature / budget rectifiers. GitHub Copilot passes Anthropic
-/// models through to its native `/v1/messages`, where history replayed from another
-/// provider or from the Responses bridge fails signature validation; errors from its
-/// Chat / Responses bridges never match the rectifier keywords.
-fn uses_anthropic_rectifiers(provider_type: Option<ProviderType>) -> bool {
-    matches!(
-        provider_type,
-        Some(ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::GitHubCopilot)
-    )
+/// Whether an upstream error from this attempt can come from an Anthropic Messages
+/// endpoint, so the thinking signature / budget rectifiers apply.
+///
+/// GitHub Copilot picks the protocol per request: only requests passed through to its
+/// native `/v1/messages` qualify, where history replayed from another provider or from
+/// the Responses bridge fails signature validation. Its Chat and Responses bridges have
+/// no Anthropic thinking signatures to repair, and an error there could still trip the
+/// broad `invalid request` keyword and strip the reasoning the Responses bridge carries.
+fn uses_anthropic_rectifiers(
+    provider_type: Option<ProviderType>,
+    claude_api_format: Option<&str>,
+) -> bool {
+    match provider_type {
+        Some(ProviderType::Claude | ProviderType::ClaudeAuth) => true,
+        Some(ProviderType::GitHubCopilot) => claude_api_format == Some("anthropic"),
+        _ => false,
+    }
 }
 
 /// Pick the Copilot upstream protocol for a Claude-client request.
@@ -6273,22 +6292,33 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_rectifiers_cover_copilot_native_messages() {
-        for provider_type in [
-            ProviderType::Claude,
-            ProviderType::ClaudeAuth,
-            ProviderType::GitHubCopilot,
-        ] {
-            assert!(uses_anthropic_rectifiers(Some(provider_type)));
+    fn anthropic_rectifiers_cover_copilot_native_messages_only() {
+        for provider_type in [ProviderType::Claude, ProviderType::ClaudeAuth] {
+            for format in [None, Some("anthropic"), Some("openai_chat")] {
+                assert!(uses_anthropic_rectifiers(Some(provider_type), format));
+            }
+        }
+        assert!(uses_anthropic_rectifiers(
+            Some(ProviderType::GitHubCopilot),
+            Some("anthropic")
+        ));
+        for format in [None, Some("openai_chat"), Some("openai_responses")] {
+            assert!(!uses_anthropic_rectifiers(
+                Some(ProviderType::GitHubCopilot),
+                format
+            ));
         }
         for provider_type in [
             ProviderType::Codex,
             ProviderType::OpenRouter,
             ProviderType::CodexOAuth,
         ] {
-            assert!(!uses_anthropic_rectifiers(Some(provider_type)));
+            assert!(!uses_anthropic_rectifiers(
+                Some(provider_type),
+                Some("anthropic")
+            ));
         }
-        assert!(!uses_anthropic_rectifiers(None));
+        assert!(!uses_anthropic_rectifiers(None, Some("anthropic")));
     }
 
     #[test]
@@ -6409,6 +6439,7 @@ mod tests {
                     &Extensions::new(),
                     adapter.as_ref(),
                     &mut codex_upstream_format,
+                    &mut None,
                 )
                 .await
             {
